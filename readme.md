@@ -2,7 +2,7 @@ RedditBot
 ---------
 My bot for [Reddit](http://www.reddit.com/).
 
-Its purpose is still being thoughtout, but I'm at a "black triangle" point in
+Its purpose is still being thought out, but I'm at a "black triangle" point in
 development. It's written in [Go](http://www.golang.org) and sticks to the
 Reddit api limits. Bonus: it's full of constants :)
 
