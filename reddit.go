@@ -9,35 +9,33 @@ import (
 	"net/http"
 	"net/smtp"
 	"net/url"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	timeFormat                = "Jan 02, 2006"
-	commentHeaderSingleFormat = "/u/%s's most popular post:\n\n"
-	commentHeaderPluralFormat = "/u/%s's %d most popular posts:\n\n"
-	tableBodyFormat           = "%d | [%s](%s) | [%d](%s) | %s | /r/%s\n"
-	tableHeader               = "Score | Title | #Cmts | Posted | Sub\n--:|:--|--:|:--|:--\n"
-	commentFooter             = "*This bot was made by /u/AUTHOR, please address any complaints or suggestions to him.*"
-	firstPost                 = "This is OP's first post. Congratulations OP!\n\n"
+	commentHeaderFormat = "Top example usage of *%s* from [Wordnik](http://www.wordnik.com/):\n\n"
+	commentBodyFormat   = ">%s\n\n[Origin.](%s)\n\n"
+	commentFooter       = "*I'm a bot and unaffiliated with Wordnik.*"
 
-	userAgent   = "/u/BOTNAME by /u/AUTHOR"
+	userAgent   = ""
 	contentType = "application/x-www-form-urlencoded"
 
 	timeBetweenRequests = 2 * time.Second
-	timeCached          = 30 * time.Second //10 * time.Minute
-
-	numberOfAuthorPosts = 10
+	timeBetweenComments = 10 * time.Minute
+	timeCached          = 30 * time.Second
 
 	redditUsername = ""
 	redditPassword = ""
+	wordnikKey     = ""
 
 	emailAddress  = ""
 	emailPassword = ""
-	emailServer   = "smtp.gmail.com"
-	emailPort     = "587"
+	emailServer   = ""
+	emailPort     = ""
 	emailSubject  = "Subject: RedditBot: An error occured!\n"
 	emailMime     = "MIME-version: 1.0;\nContent-Type: text/plain; charset=\"UTF-8\";\n\n"
 )
@@ -61,27 +59,25 @@ type UserJson struct {
 }
 
 type JsonData struct {
-	Data Entries "data"
+	Data Entries
 }
 
 type Entries struct {
-	Children []Entry "children"
+	Children []Entry
 }
 
 type Entry struct {
-	Data EntryData "data"
+	Data EntryData
 }
 
 type EntryData struct {
-	Url          string
-	Permalink    string
-	Subreddit    string
-	Name         string
-	Author       string
-	Title        string
-	Score        int
-	Num_comments int
-	Created_UTC  float32
+	Name  string
+	Title string
+}
+
+type WordnikExample struct {
+	Url  string
+	Text string
 }
 
 func main() {
@@ -96,10 +92,10 @@ func main() {
 	before := ""
 	limit := 1
 
-	for true {
+	for {
 		startTime := time.Now()
 
-		section, err := getSection("new", user, before, limit)
+		section, err := getSection("new", user, before, limit, "rising")
 		if err != nil {
 			sendErrorEmail(err)
 			log.Fatal(err)
@@ -111,31 +107,31 @@ func main() {
 			log.Fatal(err)
 		}
 
-		entriesLength := len(entries)
+		if len(entries) > 0 {
+			for i := range entries {
+				data := entries[i].Data
 
-		if entriesLength > 0 {
-			for i := 0; i < entriesLength; i++ {
-				author := entries[i].Data.Author
-				authorEntries, err := getAuthorPosts(author, "top", numberOfAuthorPosts, user)
+				commentText, err := makeComment(data.Title)
 				if err != nil {
 					sendErrorEmail(err)
 					log.Fatal(err)
 				}
-
-				/*
-				name := entries[i].Data.Name
-				fmt.Println(name)
-				*/
-				commentText := makeComment(authorEntries)
-				fmt.Println(commentText)
-				//err = comment(name, commentText, user)
-				if err != nil {
-					sendErrorEmail(err)
-					log.Fatal(err)
+				if len(commentText) > 0 {
+					fmt.Println(data.Name)
+					fmt.Println(commentText)
+					err = comment(data.Name, commentText, user)
+					if err != nil {
+						sendErrorEmail(err)
+						log.Fatal(err)
+					}
+					time.Sleep(timeBetweenComments)
+					break
+				} else {
+					fmt.Println("no usable words in: " + data.Title)
 				}
 			}
 
-			before = entries[0].Data.Name
+			//before = entries[0].Data.Name
 		}
 
 		limit = 100
@@ -149,7 +145,7 @@ func login(username string, passwd string) (User, error) {
 	myUrl := "https://ssl.reddit.com/api/login/" + username
 	form := url.Values{"user": {username}, "passwd": {passwd}, "api_type": {"json"}}
 
-	data, err := customRequest("POST", myUrl, form, make(http.Header))
+	data, err := redditRequest("POST", myUrl, form, make(http.Header))
 
 	if err != nil {
 		return user, err
@@ -171,8 +167,8 @@ func login(username string, passwd string) (User, error) {
 	return user, nil
 }
 
-func getSection(section string, user User, before string, limit int) ([]byte, error) {
-	myUrl := "http://www.reddit.com/" + section + ".json?sort=rising&limit=" + strconv.Itoa(limit)
+func getSection(section string, user User, before string, limit int, sort string) ([]byte, error) {
+	myUrl := "http://www.reddit.com/" + section + ".json?sort=" + sort + "&limit=" + strconv.Itoa(limit)
 
 	if before != "" {
 		myUrl += "&before=" + before
@@ -181,7 +177,7 @@ func getSection(section string, user User, before string, limit int) ([]byte, er
 	header := make(http.Header)
 	header.Set("Cookie", user.Cookie)
 
-	data, err := customRequest("GET", myUrl, url.Values{}, header)
+	data, err := redditRequest("GET", myUrl, url.Values{}, header)
 	if err != nil {
 		return nil, err
 	}
@@ -199,48 +195,78 @@ func makeEntries(jsonData []byte) ([]Entry, error) {
 	return data.Data.Children, nil
 }
 
-func getAuthorPosts(author string, sort string, limit int, user User) ([]Entry, error) {
-	var data JsonData
-	myUrl := "http://www.reddit.com/user/" + author + "/submitted.json?limit=" + strconv.Itoa(limit) + "&sort=" + sort
+func makeComment(title string) (string, error) {
+	var example WordnikExample
 
-	header := make(http.Header)
-	header.Set("Cookie", user.Cookie)
+	commentHeader := ""
+	commentBody := ""
 
-	jsonData, err := customRequest("GET", myUrl, url.Values{}, header)
+	r, err := regexp.Compile("[^A-Za-z ]")
 	if err != nil {
-		return data.Data.Children, err
+		return "", err
 	}
 
-	err = json.Unmarshal(jsonData, &data)
-	if err != nil {
-		return data.Data.Children, err
+	title = r.ReplaceAllString(title, " ")
+	words := strings.Split(title, " ")
+	for i := range words {
+		words[i] = strconv.Itoa(len(words[i])) + words[i]
+	}
+	sort.Strings(words)
+	for i := range words {
+		words[i] = r.ReplaceAllString(words[i], "")
 	}
 
-	return data.Data.Children, nil
+	word := ""
+	for i := range words {
+		word = words[len(words)-i-1]
+		if len(word) > 0 {
+			example, err = getExample(word)
+			if err != nil {
+				return "", err
+			}
+			if len(example.Text) > 0 {
+				break
+			}
+		}
+	}
+
+	if len(example.Text) == 0 {
+		return "", nil
+	}
+
+	commentHeader = fmt.Sprintf(commentHeaderFormat, word)
+	commentBody = fmt.Sprintf(commentBodyFormat, example.Text, example.Url)
+
+	return commentHeader + commentBody + commentFooter, nil
 }
 
-func makeComment(entries []Entry) string {
-	length := len(entries)
-	commentHeader := ""
-	if length == 0 {
-		return firstPost + commentFooter
-	} else if length == 1 {
-		commentHeader = fmt.Sprintf(commentHeaderSingleFormat, entries[0].Data.Author)
-	} else {
-		commentHeader = fmt.Sprintf(commentHeaderPluralFormat, entries[0].Data.Author, length)
-	}
-	tableBody := ""
+func getExample(word string) (WordnikExample, error) {
+	var example WordnikExample
+	url := "http://api.wordnik.com//v4/word.json/" + word + "/topExample?useCanonical=false"
 
-	for i := 0; i < length; i++ {
-		data := entries[i].Data
-		posted := time.Unix(int64(data.Created_UTC), 0).Format(timeFormat)
-		title := strings.TrimSpace(strings.Replace(data.Title, "|", "&#124;", -1))
-
-		tableBody += fmt.Sprintf(tableBodyFormat,
-			data.Score, title, data.Url, data.Num_comments, data.Permalink, posted, data.Subreddit)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return example, err
 	}
 
-	return commentHeader + tableHeader + tableBody + commentFooter
+	req.Header.Add("api_key", wordnikKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		return example, err
+	}
+
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return example, err
+	}
+
+	err = json.Unmarshal(body, &example)
+	if err != nil {
+		return example, err
+	}
+
+	return example, nil
 }
 
 func comment(thing string, text string, user User) error {
@@ -248,19 +274,19 @@ func comment(thing string, text string, user User) error {
 	header := make(http.Header)
 	header.Set("Cookie", user.Cookie)
 
-	data, err := customRequest("POST", "http://www.reddit.com/api/comment", form, header)
+	data, err := redditRequest("POST", "http://www.reddit.com/api/comment", form, header)
 	if err != nil {
 		return err
 	}
 
-	if strings.Contains(string(data), "/u/andreasfrom") != true {
+	if strings.Contains(string(data), "a bot") != true {
 		return errors.New("comment: " + string(data))
 	}
 
 	return nil
 }
 
-func customRequest(method string, url string, values url.Values, header http.Header) ([]byte, error) {
+func redditRequest(method string, url string, values url.Values, header http.Header) ([]byte, error) {
 	form := strings.NewReader(values.Encode())
 
 	req, err := http.NewRequest(method, url, form)
@@ -274,7 +300,7 @@ func customRequest(method string, url string, values url.Values, header http.Hea
 
 	time.Sleep(timeBetweenRequests - time.Since(lastRequest))
 	lastRequest = time.Now()
-	//fmt.Printf("Made request: %v\n", lastRequest)
+	fmt.Printf("Made request: %v\n", lastRequest)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
