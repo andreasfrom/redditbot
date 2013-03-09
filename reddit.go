@@ -130,8 +130,6 @@ func main() {
 					fmt.Println("no usable words in: " + data.Title)
 				}
 			}
-
-			//before = entries[0].Data.Name
 		}
 
 		limit = 100
